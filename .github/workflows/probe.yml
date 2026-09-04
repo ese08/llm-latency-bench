@@ -1,0 +1,356 @@
+# ============================================================================
+# 定时采样：每 15 分钟从 GitHub Actions（美国）打一轮请求，结果以 JSONL 落回仓库。
+#
+# 【前提：仓库必须是公开的】
+#   私有仓库的 Actions 分钟数是配额制的。本工作流一周会跑约 670 次、每次数分钟，
+#   私有仓库的免费额度撑不住，跑到一半会静默停摆、留下一段有系统性缺口的数据。
+#   公开仓库的 GitHub 托管 runner 才是免费不限量的。
+#
+# 【公开仓库的代价：results/ 下的一切对全世界可见】
+#   落盘的采样记录里包含 egress_ip、egress_geo、模型名、token 数、成本、
+#   以及 prompt_hash / prompt_pack 标记。提示词正文本身不落盘（只落哈希），
+#   但如果你用 PROMPT_PACK_B64 传了生产提示词，请再确认一遍 payloads.js
+#   和 probe.js 确实没有把提示词原文写进记录。API key 任何时候都不许落盘。
+#
+# 【commit 历史污染警告】
+#   每轮采样 = 1 个 commit。一周 ≈ 670 个、一个月 ≈ 2900 个 github-actions[bot] commit。
+#   这会让 git log / blame / GitHub 首页的贡献图基本不可读。
+#   如果这个仓库还承载别的代码，强烈建议把 results/ 拆成一个独立的数据仓库，
+#   或者改成「攒够一天再提交一次」（代价是崩溃时最多丢一天数据）。
+#   本文件选择「每轮一提交」，因为长跑实验里「数据不丢」比「历史干净」重要得多。
+#
+# 【需要配置的 repository secrets】
+#   SILICONFLOW_API_KEY / ARK_API_KEY / OPENROUTER_API_KEY（缺哪个就跳过哪个平台的配置）
+#   PROMPT_PACK_B64（可选，生产提示词包）
+#   全部只经 env 传给 node 进程，任何一步都不得 echo、不得开 ACTIONS_STEP_DEBUG，
+#   任何一步都不要用 `set -x`（会把整个环境连同密钥打进日志）。
+# ============================================================================
+
+name: probe
+
+on:
+  schedule:
+    # 刻意避开整点。官方原话：「schedule 事件在高负载期间可能被延迟，
+    # 高负载时段包括每小时的开始……如果负载足够高，部分排队的任务可能被丢弃。」
+    # 用 */15 会让四个采样点里有一个（:00）恒定落在最差的时段上，
+    # 那样测出来的「整点变慢」是 GitHub 调度器的伪影，不是被测服务的性质。
+    # 7/22/37/52 把四个点均匀铺在整点之后 7 分钟起的位置。
+    - cron: '7,22,37,52 * * * *'
+  # 手动触发，用于调试和补采。注意手动触发的 run 没有「计划时刻」，
+  # 下面的 SCHEDULED_FOR 解析步骤会退化成 job 开始时刻。
+  workflow_dispatch:
+
+# 权限最小化：只要写仓库（push 结果）+ 读 Actions（用 gh api 查本次 run 的 created_at）。
+permissions:
+  contents: write
+  actions: read
+
+# ---------------------------------------------------------------------------
+# 【为什么这里没有 concurrency 块】
+#
+# 1. 默认语义会丢数据。官方原话：「默认情况下，同一 concurrency group 中任何已存在的
+#    pending 任务或工作流都会被取消，由新排队的那个取而代之。」
+#    也就是说 concurrency 的队列槽位只有 1 个，cancel-in-progress: false 只保护
+#    「正在跑的那个」，不保护「排队中的那个」——排队中的照样被新 run 顶掉。
+#    对一个每 15 分钟采一次的实验来说，这等于静默丢采样点，比冲突严重得多。
+#
+# 2. 现在确实有真排队了，但我们仍然不用。GitHub 于 2026-05-07 发布了
+#    concurrency.queue: max（与 cancel-in-progress: false / 不设时配合使用，
+#    单组最多 100 个 pending，FIFO；与 cancel-in-progress: true 组合会直接校验失败）。
+#    它能做到「一个都不丢」。但对本实验它解决错了问题：
+#    排队不会丢样本，却会把样本**推迟到别的时段**——而「时段」正是这个实验的自变量。
+#    一个本该属于 14:07 的样本被排到 14:35 才跑，等于 14:07 这个格子空了、
+#    14:35 那个格子被塞了两个。位移和丢弃对时段分析同样有害。
+#
+# 3. 而并行跑没有任何代价：每个 run 是**各自独立的 runner**（不同机器、不同出口 IP），
+#    彼此之间没有 CPU、网卡或 TCP 连接的争用，测量互不污染。
+#    唯一真正共享的资源是 git ref，而那个由「独立文件名 + push 失败重试」解决——
+#    见下面的提交步骤：每个 run 写的文件名都含 round ISO 和 run_id，内容永不冲突，
+#    冲突只可能发生在 ref 层面，rebase 一次就化解。
+#
+# 如果你后来改主意、宁可要严格串行（例如换成自建 runner、机器只有一台），
+# 把下面三行取消注释即可；届时务必带上 queue: max，否则就是在丢采样点：
+#
+# concurrency:
+#   group: probe
+#   cancel-in-progress: false
+#   queue: max
+# ---------------------------------------------------------------------------
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+
+    # 一轮正常大约 5~8 分钟（最多 5 配置 × 3 任务 × 3 重复 = 45 个请求，串行，
+    # 外加 config.js 里的 intraBurst/interConfig 间隔和最多 60s 的起跑抖动）。
+    # 这里给到 30 分钟而不是「刚好够用」，是刻意的：
+    # 请求级超时已由 config.js 的 TIMEOUTS.totalMs=120s 兜住，job 超时只是防进程卡死的最后一道闸。
+    # 把 job 超时压得太紧，会系统性地砍掉「大量请求超时」的那些轮次——
+    # 而那恰恰是最该被记录下来的最慢时段，砍掉就是工作流层面的幸存者偏差。
+    timeout-minutes: 30
+
+    steps:
+      - name: 检出仓库
+        uses: actions/checkout@v7
+        with:
+          # 只要最新一个 commit 就够：报表在另一个工作流里跑，这里只追加新文件。
+          # 采样一周后历史会有几百个 commit，浅克隆能省下每轮的克隆时间。
+          # 后面的 push 只做「本地 1 个 commit rebase 到远端 N 个 commit 上」，
+          # 合并基点就是浅克隆边界本身，浅仓库能正常完成。
+          fetch-depth: 1
+          # 用默认的 GITHUB_TOKEN 提交。它的 push **不会**触发新的工作流，
+          # 所以不需要在 commit message 里写 [skip ci]。
+          # 如果以后换成 PAT 或 Deploy Key，必须自己加 [skip ci]，否则会自触发成死循环。
+          persist-credentials: true
+
+      - name: 安装 Node 20
+        uses: actions/setup-node@v7
+        with:
+          node-version: '20'
+          # 刻意不开 cache：运行时零第三方依赖、仓库里也没有锁文件，
+          # 打开缓存只会每轮多报一次「找不到锁文件」的警告，没有任何收益。
+
+      # -----------------------------------------------------------------------
+      # 【SCHEDULED_FOR 的取值：调研结论与最终选择】
+      #
+      # 目标是给 schema.js 的 schedule_drift_ms 提供一个「计划触发时刻」。候选方案：
+      #
+      #   A. ${{ github.event.schedule }}
+      #      官方确认它存在，但它的值是 **cron 表达式字符串**（'7,22,37,52 * * * *'），
+      #      不是时刻。直接排除。
+      #      （github.event.repository.pushed_at 更不对——那是仓库最后一次 push 的时间，
+      #        对定时 run 而言完全无关；而且我们自己每轮都在 push，它会一直漂。）
+      #
+      #   B. github 上下文里的某个「run 开始时刻」
+      #      官方 contexts 参考里 **没有** github.run_started_at 这个属性
+      #      （有 run_id / run_number / run_attempt，没有时刻）。
+      #      表达式里取不存在的属性会静默求值成空串，靠它会得到一列空数据。排除。
+      #
+      #   C. 由 cron 表达式反推「名义时刻」：取不晚于 run 创建时刻、且分钟数属于 {7,22,37,52}
+      #      的最近那一格。这是唯一能测出 **GitHub 调度器本身延迟** 的办法。
+      #      它的失效条件是延迟 ≥ 15 分钟（一个完整的 cron 周期）：那时候「最近一格」
+      #      已经是下一次 cron 的名义时刻了，反推会按 15 分钟的整数倍**向下混叠**，
+      #      把「迟到 16 分钟」算成「迟到 1 分钟」。
+      #      要命的是它错得很像对的——输出永远是个 0~15 分钟之间的正常数字，
+      #      没有任何标记能区分「真的只迟到 1 分钟」和「迟到 16 分钟被混叠了」。
+      #      而官方说高负载时不但会延迟、「部分排队的任务可能被丢弃」，
+      #      也就是说延迟最大的那些时段恰好是它最可能悄悄骗人的时段。
+      #
+      #   D. REST 里本次 run 的 created_at（GET /repos/{owner}/{repo}/actions/runs/{run_id}）
+      #      这是从 run 内部能拿到的、唯一有权威来源的真实时刻。
+      #
+      # 最终选择：**D**，并如实说明它测的是什么。
+      #
+      #   SCHEDULED_FOR = 本次 workflow run 被 GitHub **创建**的时刻。
+      #   于是 schedule_drift_ms = run 创建 → 探针真正发出第一个请求，
+      #   它包含的是【runner 排队获取 + 检出 + 装 Node + 起跑抖动】。
+      #
+      #   它**不包含** GitHub cron 调度器自身的延迟（cron 名义时刻 → run 被创建）。
+      #   而按官方说法，整点高负载时被拖延的恰恰是这一段。换句话说：
+      #   **本列会系统性低估真实的 cron 抖动，它不是 cron 延迟的度量。**
+      #   分析时段规律请一律以每条样本的 ts_wall_utc（真实墙钟）分桶，
+      #   不要用 cron 名义时刻分桶，否则被延迟的样本会被算进错误的时段。
+      #
+      # 方案 C 的名义时刻仍然算一份，但只写进 job summary 供人工审计、不进数据列：
+      # 人看 summary 时会连带看到 run 创建时刻，能自己判断混叠有没有发生；
+      # 而一旦进了 JSONL 就再没有旁证，一个静默错误的数字比没有数字更糟。
+      #
+      # 如果跑了几天后发现调度器延迟普遍很小（summary 里的推测延迟一直 < 5 分钟），
+      # 那混叠风险可以忽略，届时可以改用方案 C 拿到更完整的 drift：
+      # 把下面 `echo "scheduled_for=..."` 的取值从 ${created} 换成算出来的名义时刻即可，
+      # 但换之前请务必在 README 里同步改掉这一列的定义，别让新旧两段数据混在一张图上。
+      # -----------------------------------------------------------------------
+      - name: 解析本次 run 的计划时刻
+        id: sched
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RUN_ID: ${{ github.run_id }}
+        run: |
+          set -euo pipefail
+
+          created=''
+          # gh CLI 在 ubuntu-latest 上是预装的。查不到就退化，绝不让整轮采样因为这一步失败。
+          if created_raw="$(gh api "repos/${GH_REPO}/actions/runs/${RUN_ID}" --jq '.created_at' 2>/dev/null)"; then
+            if [ -n "${created_raw}" ] && [ "${created_raw}" != 'null' ]; then
+              created="${created_raw}"
+              source_note='run.created_at（GitHub 创建本次 run 的时刻）'
+            fi
+          fi
+
+          if [ -z "${created}" ]; then
+            # 只有 API 查不到时才走到这里。此时 drift 恒约等于 0，那一列对本轮没有参考价值，
+            # 但仍然必须给出一个合法的 ISO 值，不能留空——留空会让下游把整轮判成脏数据。
+            created="$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
+            source_note='job 开始时刻（API 查询失败时的降级值，本轮 schedule_drift_ms 无意义）'
+          fi
+
+          echo "scheduled_for=${created}" >> "$GITHUB_OUTPUT"
+          echo "计划时刻取自：${source_note}"
+
+          # 只写进 summary 的名义时刻。见上面对方案 C 的说明：仅供人工判断
+          # 「GitHub 这次到底迟到了多久」，不作为数据列，也不参与任何计算。
+          CREATED_AT="${created}" node -e '
+            const slots = [7, 22, 37, 52];
+            const created = new Date(process.env.CREATED_AT);
+            const anchor = new Date(created);
+            anchor.setUTCSeconds(0, 0);
+            let nominal = null;
+            for (let back = 0; back < 60 && !nominal; back += 1) {
+              const candidate = new Date(anchor.getTime() - back * 60000);
+              if (slots.includes(candidate.getUTCMinutes())) nominal = candidate;
+            }
+            const lagMin = nominal ? (created - nominal) / 60000 : null;
+            const lines = [
+              "### 本轮时刻",
+              "",
+              "| 项 | 值 |",
+              "| --- | --- |",
+              "| run 创建时刻（= SCHEDULED_FOR） | `" + created.toISOString() + "` |",
+              "| 反推的 cron 名义时刻（仅审计） | `" + (nominal ? nominal.toISOString() : "n/a") + "` |",
+              "| 推测的调度器延迟（分钟） | " + (lagMin === null ? "n/a" : lagMin.toFixed(2)) + " |",
+              "",
+              "> 名义时刻由 cron 分钟位向前反推，仅在真实延迟 < 15 分钟（一个 cron 周期）时可信。延迟一旦超过 15 分钟，这里会按 15 分钟的整数倍向下混叠、显示成一个看起来很正常的小数字。这一行只供人工审计，不进 JSONL。",
+            ];
+            require("node:fs").appendFileSync(process.env.GITHUB_STEP_SUMMARY, lines.join("\n") + "\n");
+          '
+
+      # 首跑校验。preflight 会确认密钥有效、模型可用、图片素材存在等，
+      # 硬失败时它自己 exit 1；这里让整个 job 跟着失败，而不是带着坏配置采一周垃圾数据。
+      - name: 必要时先跑 preflight
+        env:
+          SILICONFLOW_API_KEY: ${{ secrets.SILICONFLOW_API_KEY }}
+          ARK_API_KEY: ${{ secrets.ARK_API_KEY }}
+          OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
+          PROMPT_PACK_B64: ${{ secrets.PROMPT_PACK_B64 }}
+          NODE_LABEL: gha-us
+          RUNNER_OS: ${{ runner.os }}
+          RUNNER_ARCH: ${{ runner.arch }}
+        run: |
+          set -euo pipefail
+
+          # compgen 在没有任何匹配时返回非零，正好当作「从没跑过」的判据。
+          #
+          # 只认 preflight-ok-*.json。preflight 失败时写的是 preflight-fail-*.json，
+          # 而提交步骤是 if: always()，失败报告同样会被 commit 上去——
+          # 如果这里用 preflight-*.json 通配，首次因 secret 配错而失败之后，
+          # 那份失败报告会让后续每一轮都跳过校验，而采样又每轮以同样原因失败且不再打印原因。
+          if compgen -G 'results/preflight-ok-*.json' > /dev/null; then
+            echo '已存在通过的 preflight 产物，跳过。要重新校验请删掉 results/preflight-ok-*.json 再触发一次。'
+            exit 0
+          fi
+
+          echo '首次运行，先跑前置校验。'
+          if ! node src/preflight.js; then
+            echo '::error title=preflight 硬失败::前置校验没通过，本轮不采样。常见原因：某个 API key 没配或已失效、模型 id 在平台上不存在、图片素材缺失。请看上面 preflight 打印的具体条目，修好后重新触发本工作流；在此之前所有定时轮次都会以同样的原因失败。'
+            exit 1
+          fi
+
+      - name: 跑一轮采样
+        id: round
+        env:
+          # 密钥只挂在真正需要它们的这两步上，不放 job 级 env——
+          # 避免检出、装 Node 这些第三方 action 的进程也能读到。
+          SILICONFLOW_API_KEY: ${{ secrets.SILICONFLOW_API_KEY }}
+          ARK_API_KEY: ${{ secrets.ARK_API_KEY }}
+          OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
+          PROMPT_PACK_B64: ${{ secrets.PROMPT_PACK_B64 }}
+          NODE_LABEL: gha-us
+          SCHEDULED_FOR: ${{ steps.sched.outputs.scheduled_for }}
+          # runner 本来就会导出 RUNNER_OS / RUNNER_ARCH，这里显式再写一遍，
+          # 是为了让「工作流传给脚本的环境契约」在文件里一眼可见，也便于本地复现。
+          RUNNER_OS: ${{ runner.os }}
+          RUNNER_ARCH: ${{ runner.arch }}
+        run: |
+          set -euo pipefail
+          # 出口 IP / 地理位置由 src/lib/env.js 自己去查（它需要外网，runner 默认有）。
+          # 这里不代查，免得把查询逻辑分散在两处、两边格式对不上。
+          node src/run-round.js
+
+      # 无论采样成功、失败还是被 job 超时掐断，都要把已经落盘的部分提交上去。
+      # run-round.js 是逐条追加写 JSONL 的，半途中断留下的每一行仍然是完整有效的样本，
+      # 而「一轮里前 20 个请求正常、第 21 个开始全超时」正是最有价值的证据。
+      - name: 提交并推送结果
+        if: always()
+        env:
+          BRANCH: ${{ github.ref_name }}
+          ROUND_TAG: ${{ steps.sched.outputs.scheduled_for }}
+          RUN_ID: ${{ github.run_id }}
+          RUN_ATTEMPT: ${{ github.run_attempt }}
+        run: |
+          set -euo pipefail
+
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+
+          # results/ 可能还不存在或是个空目录（首轮、或采样在写第一条之前就挂了），
+          # 这两种情况下 `git add -- results` 会以 pathspec 不匹配报错，先挡掉。
+          if [ -z "$(ls -A results 2>/dev/null || true)" ]; then
+            echo '本轮没有任何产物，无需提交。'
+            exit 0
+          fi
+
+          # 冲突只可能来自「另一个 run 也 push 了它自己的新文件」——
+          # 文件名带 round ISO 和 run_id，两个 run 绝不会写同一个路径，永远不会有内容冲突，
+          # 只可能在 ref 层面撞车。
+          #
+          # 正因为不会有内容冲突，这里刻意**不用 rebase**：checkout 是 fetch-depth:1 的浅克隆，
+          # 浅仓库上的 `git pull --rebase` 能不能算出 merge-base 取决于 fetch 带回多少历史
+          # （fetch 只保证带回新 tip 的 depth-1），撞上边界就会失败，而且失败得很难读。
+          # 改成「fetch → hard reset 到远端 → 重新 add 本轮文件 → 重新 commit」，
+          # 全程不需要 merge-base，浅克隆下行为确定。
+          # 关键前提：`git reset --hard` 不会删除 untracked 文件，本轮刚写出的 JSONL 安然无恙。
+          for attempt in 1 2 3 4 5; do
+            if [ "${attempt}" -gt 1 ]; then
+              echo "push 被拒，同步到最新远端后重试第 ${attempt} 次。"
+              git fetch origin "${BRANCH}"
+              git reset --hard FETCH_HEAD
+            fi
+
+            git add -A -- results
+            if git diff --cached --quiet; then
+              echo '本轮没有新增或改动文件，无需提交。'
+              exit 0
+            fi
+
+            # commit message 只放「哪一轮、哪个 run」，不含任何采样数值。
+            # 理由有二：一是 commit message 会出现在通知邮件、RSS、各种镜像里，
+            # 数据只应有 JSONL 一个权威副本；二是消息里带数字会诱使人拿 git log 当数据源，
+            # 而 git log 里没有 schema_version，读法一旦漂移就没人发现。
+            git commit -m "chore(probe): round ${ROUND_TAG} (run ${RUN_ID} attempt ${RUN_ATTEMPT})"
+
+            if git push origin "HEAD:${BRANCH}"; then
+              echo "push 成功（第 ${attempt} 次尝试）。"
+              exit 0
+            fi
+
+            # 随机退避：多个 run 同时被 push 拒绝时，固定退避会让它们继续同步撞车。
+            sleep "$(( (RANDOM % 15) + attempt * 5 ))"
+          done
+
+          echo '::error title=push 结果失败::连续 5 次推送被拒。本轮数据没进仓库，但已作为 artifact 上传（见本次 run 的 Artifacts），可手工取回补录。'
+          exit 1
+
+      # push 失败的兜底：至少让数据在 artifact 里留一份。
+      # 保留 14 天足够人工发现并补录；长期存档仍以仓库里的 JSONL 为唯一权威副本。
+      - name: 兜底上传本轮结果
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: round-${{ github.run_id }}-${{ github.run_attempt }}
+          # 只挑本次 run 自己写的文件——但 glob 必须跟 run-round.js 实际写出的名字完全对上。
+          # 它写的是 round-<ISO>-<run_id>.jsonl，而其中的 run_id 由 lib/env.js 拼成
+          # `gha-<GITHUB_RUN_ID>-<GITHUB_RUN_ATTEMPT>`，所以文件名结尾是 -gha-123456-1.jsonl。
+          # 之前写成 *-${{ github.run_id }}.jsonl 少了 gha- 前缀和 attempt 后缀，
+          # 永远匹配不到任何文件——而 push 失败时的错误提示还告诉运维「已作为 artifact 上传，
+          # 可手工取回补录」，等于给了一条不存在的退路。
+          path: |
+            results/**/*-gha-${{ github.run_id }}-${{ github.run_attempt }}.jsonl
+            results/preflight-*.json
+          retention-days: 14
+          # 采样在写第一条之前就失败时没有文件，这属于正常情况，不该把步骤标红。
+          if-no-files-found: ignore

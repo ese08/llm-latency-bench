@@ -1,0 +1,21 @@
+# 工作流里的 shell 脚本必须是 LF。
+# 这条不是洁癖：Windows 上写出的 CRLF 提交进来后，ubuntu runner 的 bash 会把
+# `for ... do\r` 报成语法错误，而报错信息（unexpected token $'do\r'）完全看不出是行尾问题，
+# 排查起来极其费时。采样脚本一旦这样炸掉，整周数据就是空的。
+*.yml text eol=lf
+*.yaml text eol=lf
+*.sh text eol=lf
+
+# 源码统一 LF，避免跨平台协作时整文件 diff。
+*.js text eol=lf
+*.mjs text eol=lf
+*.json text eol=lf
+*.md text eol=lf
+
+# 采样产物。标成 linguist-generated 后，GitHub 的 diff 默认折叠、也不计入语言统计——
+# 一周约 700 次提交、每次一个 JSONL，不这么标的话仓库首页会被 JSON 占满。
+results/**/*.jsonl text eol=lf linguist-generated=true
+
+*.jpg binary
+*.jpeg binary
+*.png binary

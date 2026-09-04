@@ -1,0 +1,111 @@
+# ============================================================================
+# 生成静态 HTML 报表：读 results/**/*.jsonl，产出一份可离线打开的 report.html。
+#
+# 这个工作流是**只读**的：它不写仓库、不碰任何 API key、也不发请求给被测平台。
+# 报表只做统计和渲染，所以它随时可以重跑，重跑不会污染数据。
+#
+# 前提同 probe.yml：仓库需公开才有免费分钟数，且 results/ 下的数据对外可见。
+# ============================================================================
+
+name: report
+
+on:
+  # 平时都用手动触发：数据是每 15 分钟长出来的，什么时候想看就什么时候生成。
+  workflow_dispatch:
+  schedule:
+    # 每天一次。同样避开整点（官方说整点前后是 Actions 高负载时段）。
+    # 41 分 / UTC 04:41 ≈ 北京时间 12:41、美西 20:41 前一天，
+    # 落在两边都不是流量高峰的位置。报表迟到几分钟没有任何影响。
+    - cron: '41 4 * * *'
+
+# 只读仓库即可。这里刻意不给 contents: write——报表是产物不是数据，
+# 不该回写仓库，否则每天一个 commit 会和 probe 的历史混在一起更难看。
+permissions:
+  contents: read
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  report:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: 检出仓库
+        uses: actions/checkout@v7
+        with:
+          # 报表只读工作区里的文件，不需要历史。
+          # 注意：一周后 results/ 下会有几百个 JSONL，浅克隆仍然会把它们**全部**取下来
+          #（浅的是历史深度，不是文件数），report.js 能看到完整数据集。
+          fetch-depth: 1
+
+      - name: 安装 Node 20
+        uses: actions/setup-node@v7
+        with:
+          node-version: '20'
+
+      - name: 生成报表
+        run: |
+          set -euo pipefail
+          # 默认 globstar 是关的，那样 ** 会退化成单层 *，
+          # 恰好只能匹配 results/<日期>/ 一层；开着才真的等价于 report.js 读的那个模式。
+          shopt -s globstar nullglob
+
+          # 没有任何数据时直接失败并说清楚原因，
+          # 比产出一个空报表、让人以为「测下来什么都没有」要好。
+          matches=(results/**/*.jsonl)
+          if [ "${#matches[@]}" -eq 0 ]; then
+            echo '::error title=没有采样数据::results/ 下找不到任何 .jsonl。请先确认 probe 工作流已经跑过并成功 push 过结果。'
+            exit 1
+          fi
+          echo "找到 ${#matches[@]} 个采样文件。"
+
+          node src/report.js --out report.html
+
+      - name: 上传报表
+        uses: actions/upload-artifact@v7
+        with:
+          name: report-${{ github.run_id }}
+          path: report.html
+          # 90 天是 artifact 的上限，也刚好够覆盖「跑一周 + 事后反复回看」的周期。
+          retention-days: 90
+          # 上一步保证了报表一定会生成，这里没文件就是真出问题了，必须报错而不是警告。
+          if-no-files-found: error
+
+      # -----------------------------------------------------------------------
+      # 可选：把报表发布到 GitHub Pages。
+      #
+      # 【默认关闭，打开前请想清楚】
+      # 打开这一段意味着报表会有一个**任何人都能直接访问的公网地址**
+      #（https://<owner>.github.io/<repo>/），不需要 GitHub 账号、也不需要知道仓库在哪。
+      # 报表里会出现被测平台名、模型名、每个配置的延迟分布和成本估算——
+      # 也就是一份公开的、带署名的服务商横评。这跟「数据在公开仓库里、要翻 JSONL 才看得到」
+      # 不是一回事：前者是主动发布，后者只是没有隐藏。
+      # 如果只是自己看，artifact 已经够了，别开这一段。
+      #
+      # 要启用的话，除了取消下面的注释，还需要：
+      #   1. 仓库 Settings → Pages → Source 选 "GitHub Actions"
+      #   2. 把上面的 permissions 块改成：
+      #        permissions:
+      #          contents: read
+      #          pages: write
+      #          id-token: write
+      #   3. 在 job 上加 environment: { name: github-pages, url: "${{ steps.pages.outputs.page_url }}" }
+      #
+      # - name: 准备 Pages 产物目录
+      #   run: |
+      #     set -euo pipefail
+      #     mkdir -p _site
+      #     cp report.html _site/index.html
+      #
+      # - name: 打包 Pages 产物
+      #   uses: actions/upload-pages-artifact@v4
+      #   with:
+      #     path: _site
+      #
+      # - name: 发布到 Pages
+      #   id: pages
+      #   uses: actions/deploy-pages@v4
+      # -----------------------------------------------------------------------

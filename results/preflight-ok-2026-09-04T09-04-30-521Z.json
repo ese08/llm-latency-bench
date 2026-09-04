@@ -1,0 +1,185 @@
+{
+  "at": "2026-09-04T09:04:30.521Z",
+  "verdict": "ok",
+  "node_label": "local",
+  "egress": {
+    "ip": "31.94.38.52",
+    "geo": "GB/England/London"
+  },
+  "prompt_pack": "generic",
+  "prompt_hash": "3a22ebac8515",
+  "fixtures": 8,
+  "counts": {
+    "pass": 32,
+    "warn": 1,
+    "fail": 0,
+    "skip": 0
+  },
+  "checks": [
+    {
+      "name": "siliconflow/模型清单",
+      "status": "pass",
+      "detail": "共 96 个模型"
+    },
+    {
+      "name": "siliconflow/Qwen/Qwen3.5-9B 存在",
+      "status": "pass",
+      "detail": "在 /v1/models 清单里"
+    },
+    {
+      "name": "siliconflow/Qwen/Qwen3.5-4B 存在",
+      "status": "pass",
+      "detail": "在 /v1/models 清单里"
+    },
+    {
+      "name": "ark/模型清单",
+      "status": "pass",
+      "detail": "共 130 个模型"
+    },
+    {
+      "name": "ark/doubao-seed-2-0-mini-260428 存在",
+      "status": "pass",
+      "detail": "在 /v1/models 清单里"
+    },
+    {
+      "name": "openrouter/deepinfra/bf16 端点存在",
+      "status": "pass",
+      "detail": "context=262144 max_completion=81920 价格 in=0.0000001 out=0.00000015 uptime_1d=96.66175090494704"
+    },
+    {
+      "name": "openrouter/端点可用率",
+      "status": "warn",
+      "detail": "uptime_last_1d=96.66175090494704%。锁死供应商 + 禁 fallback 意味着这部分会直接变成 404 失败样本，报表必须单独出可用率曲线，不能只统计成功样本。"
+    },
+    {
+      "name": "sf-qwen35-9b/text_ingredients",
+      "status": "pass",
+      "detail": "TTFT=2866ms E2E=6787ms tokens=520/256 http=1.1 tls=TLSv1.2"
+    },
+    {
+      "name": "sf-qwen35-9b/text_ingredients/思考已关闭",
+      "status": "pass",
+      "detail": "reasoning_tokens=0"
+    },
+    {
+      "name": "sf-qwen35-9b/image_ingredients",
+      "status": "pass",
+      "detail": "TTFT=3962ms E2E=6388ms tokens=1771/256 http=1.1 tls=TLSv1.2"
+    },
+    {
+      "name": "sf-qwen35-9b/image_ingredients/思考已关闭",
+      "status": "pass",
+      "detail": "reasoning_tokens=0"
+    },
+    {
+      "name": "sf-qwen35-4b/text_ingredients",
+      "status": "pass",
+      "detail": "TTFT=1331ms E2E=5904ms tokens=520/200 http=1.1 tls=TLSv1.2"
+    },
+    {
+      "name": "sf-qwen35-4b/text_ingredients/思考已关闭",
+      "status": "pass",
+      "detail": "reasoning_tokens=0"
+    },
+    {
+      "name": "sf-qwen35-4b/image_ingredients",
+      "status": "pass",
+      "detail": "TTFT=4406ms E2E=13319ms tokens=1770/256 http=1.1 tls=TLSv1.2"
+    },
+    {
+      "name": "sf-qwen35-4b/image_ingredients/思考已关闭",
+      "status": "pass",
+      "detail": "reasoning_tokens=0"
+    },
+    {
+      "name": "ark-mini-default/text_ingredients",
+      "status": "pass",
+      "detail": "TTFT=1621ms E2E=4228ms tokens=663/256 http=1.1 tls=TLSv1.3"
+    },
+    {
+      "name": "ark-mini-default/text_ingredients/思考已关闭",
+      "status": "pass",
+      "detail": "reasoning_tokens=0"
+    },
+    {
+      "name": "ark-mini-default/text_ingredients/档位",
+      "status": "pass",
+      "detail": "service_tier=default"
+    },
+    {
+      "name": "ark-mini-default/image_ingredients",
+      "status": "pass",
+      "detail": "TTFT=13072ms E2E=14752ms tokens=1914/256 http=1.1 tls=TLSv1.3"
+    },
+    {
+      "name": "ark-mini-default/image_ingredients/思考已关闭",
+      "status": "pass",
+      "detail": "reasoning_tokens=0"
+    },
+    {
+      "name": "ark-mini-default/image_ingredients/档位",
+      "status": "pass",
+      "detail": "service_tier=default"
+    },
+    {
+      "name": "ark-mini-fast/text_ingredients",
+      "status": "pass",
+      "detail": "TTFT=1050ms E2E=2713ms tokens=532/256 http=1.1 tls=TLSv1.3"
+    },
+    {
+      "name": "ark-mini-fast/text_ingredients/思考已关闭",
+      "status": "pass",
+      "detail": "reasoning_tokens=0"
+    },
+    {
+      "name": "ark-mini-fast/text_ingredients/档位",
+      "status": "pass",
+      "detail": "service_tier=fast"
+    },
+    {
+      "name": "ark-mini-fast/image_ingredients",
+      "status": "pass",
+      "detail": "TTFT=8522ms E2E=10466ms tokens=1780/256 http=1.1 tls=TLSv1.3"
+    },
+    {
+      "name": "ark-mini-fast/image_ingredients/思考已关闭",
+      "status": "pass",
+      "detail": "reasoning_tokens=0"
+    },
+    {
+      "name": "ark-mini-fast/image_ingredients/档位",
+      "status": "pass",
+      "detail": "service_tier=fast"
+    },
+    {
+      "name": "or-deepinfra-9b/text_ingredients",
+      "status": "pass",
+      "detail": "TTFT=567ms E2E=11877ms tokens=519/256 http=1.1 tls=TLSv1.3"
+    },
+    {
+      "name": "or-deepinfra-9b/text_ingredients/思考已关闭",
+      "status": "pass",
+      "detail": "reasoning_tokens=0"
+    },
+    {
+      "name": "or-deepinfra-9b/text_ingredients/供应商确认",
+      "status": "pass",
+      "detail": "DeepInfra（attempt=1）"
+    },
+    {
+      "name": "or-deepinfra-9b/image_ingredients",
+      "status": "pass",
+      "detail": "TTFT=1102ms E2E=15294ms tokens=1439/256 http=1.1 tls=TLSv1.3"
+    },
+    {
+      "name": "or-deepinfra-9b/image_ingredients/思考已关闭",
+      "status": "pass",
+      "detail": "reasoning_tokens=0"
+    },
+    {
+      "name": "or-deepinfra-9b/image_ingredients/供应商确认",
+      "status": "pass",
+      "detail": "DeepInfra（attempt=1）"
+    }
+  ]
+}

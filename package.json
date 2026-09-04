@@ -1,0 +1,20 @@
+{
+  "name": "llm-latency-bench",
+  "version": "0.1.0",
+  "private": true,
+  "description": "跨时段 LLM API 延迟压测：硅基流动 / 火山方舟豆包 / OpenRouter@DeepInfra",
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "preflight": "node src/preflight.js",
+    "round": "node src/run-round.js",
+    "report": "node src/report.js --out report.html",
+    "fixtures": "node tools/prepare-fixtures.mjs",
+    "fixtures:synthetic": "node tools/make-synthetic-fixtures.mjs",
+    "check": "node --check src/config.js && node --check src/payloads.js && node --check src/probe.js && node --check src/run-round.js && node --check src/preflight.js && node --check src/report.js && node --check src/lib/schema.js && node --check src/lib/http-timing.js && node --check src/lib/env.js && node --check src/providers/index.js && node --check src/providers/siliconflow.js && node --check src/providers/ark.js && node --check src/providers/openrouter.js"
+  },
+  "devDependencies": {
+    "sharp": "^0.34.0"
+  }
+}
